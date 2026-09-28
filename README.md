@@ -242,14 +242,17 @@ Rate-limit errors can expose information such as:
 
 Consumers that need to distinguish rate limiting can use `errors.Is(err, iqoption.ErrRateLimited)` and inspect the structured error when available.
 
-## Advanced Usage
+### Advanced Usage
 
-### Customizing the HTTP client
+#### Customizing the HTTP client
 
 You can provide your own `http.Client` for custom timeouts, proxies, transports, or other HTTP behavior:
 
 ```go
-import "net/http"
+import (
+	"net/http"
+	"time"
+)
 
 client, err := iqoption.New(iqoption.Config{
 	Token: "YOUR_IQ_OPTION_TOKEN",
@@ -258,6 +261,134 @@ client, err := iqoption.New(iqoption.Config{
 	},
 })
 ```
+
+When `HTTPClient` is omitted, the client uses a default HTTP configuration with a 60-second timeout and connection pooling.
+
+#### Custom endpoint
+
+By default, the client connects to:
+
+```text
+https://binary-options.mcp.iqoption.com
+```
+
+You can override the endpoint when connecting to another environment or a compatible MCP server:
+
+```go
+client, err := iqoption.New(iqoption.Config{
+	Token:    "YOUR_IQ_OPTION_TOKEN",
+	Endpoint: "https://example.internal/mcp",
+})
+```
+
+The endpoint is trimmed and falls back to `DefaultEndpoint` when empty.
+
+#### MCP protocol and client metadata
+
+The MCP protocol version, client name, and client version can be customized through `Config`:
+
+```go
+client, err := iqoption.New(iqoption.Config{
+	Token:           "YOUR_IQ_OPTION_TOKEN",
+	ProtocolVersion: "2025-06-18",
+	ClientName:      "my-trading-service",
+	ClientVersion:   "2.1.0",
+})
+```
+
+When omitted, these values default to:
+
+```go
+iqoption.DefaultProtocol
+iqoption.DefaultClientName
+iqoption.DefaultClientVersion
+```
+
+Custom client metadata can be useful when identifying different applications or deployments on the server side.
+
+#### Rate-limit retries
+
+The client automatically retries rate-limited requests. The maximum number of retries can be configured with `MaxRateLimitRetries`:
+
+```go
+client, err := iqoption.New(iqoption.Config{
+	Token:               "YOUR_IQ_OPTION_TOKEN",
+	MaxRateLimitRetries: 5,
+})
+```
+
+The default is:
+
+```go
+iqoption.DefaultMaxRateLimitRetries // 3
+```
+
+Set this according to how aggressively your application should recover from temporary rate limits. A higher value may increase request latency when the server continues returning rate-limit responses.
+
+#### Lazy session initialization
+
+Creating a client does not make a network request:
+
+```go
+client, err := iqoption.New(iqoption.Config{
+	Token: "YOUR_IQ_OPTION_TOKEN",
+})
+
+if err != nil {
+	return err
+}
+```
+
+The MCP session is initialized automatically when the first request is made. This makes `New` suitable for application startup code where you want to construct dependencies without establishing a connection immediately.
+
+#### Concurrent use
+
+`Client` is safe for concurrent use. A single client instance can therefore be shared between goroutines:
+
+```go
+client, err := iqoption.New(iqoption.Config{
+	Token: "YOUR_IQ_OPTION_TOKEN",
+})
+if err != nil {
+	return err
+}
+
+// The same client can be used by multiple goroutines.
+go func() {
+	// Make MCP requests...
+}()
+
+go func() {
+	// Make MCP requests...
+}()
+```
+
+Session establishment is internally serialized so concurrent requests do not create multiple MCP sessions unnecessarily.
+
+#### Using a custom configuration
+
+A complete configuration can combine all available options:
+
+```go
+client, err := iqoption.New(iqoption.Config{
+	Endpoint:        "https://binary-options.mcp.iqoption.com",
+	Token:           "YOUR_IQ_OPTION_TOKEN",
+	ProtocolVersion: "2025-06-18",
+	ClientName:      "my-iqoption-service",
+	ClientVersion:   "1.2.0",
+	HTTPClient: &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 20,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	},
+	MaxRateLimitRetries: 5,
+})
+```
+
+Only `Token` is required. All other configuration fields have sensible defaults.
 
 ### Finding expirations
 
