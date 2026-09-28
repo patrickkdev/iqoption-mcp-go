@@ -1,37 +1,36 @@
-# IQ Option MCP Client (Golang)
+# IQ Option MCP Client (Go)
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/patrickkdev/iqoption-mcp-client.svg)](https://pkg.go.dev/github.com/patrickkdev/iqoption-mcp-client)
-[![Go Report Card](https://goreportcard.com/badge/github.com/patrickkdev/iqoption-mcp-client)](https://goreportcard.com/report/github.com/patrickkdev/iqoption-mcp-client)
+[![Go Reference](https://pkg.go.dev/badge/github.com/patrickkdev/iqoption-mcp-go.svg)](https://pkg.go.dev/github.com/patrickkdev/iqoption-mcp-go)
 
-A resilient, high-performance Go (Golang) client for the **IQ Option API**, built on top of the **Model Context Protocol (MCP)**. This library provides a clean and reliable interface for building trading bots, automated strategies, and financial analysis tools for **Binary Options**.
+Unofficial Go client library and helper toolkit for connecting applications to IQ Option through its MCP interface. It provides a typed interface for market data, account operations, position tracking, trade history, and Binary Options trading.
 
----
-
-## 🇧🇷 Para Traders Brasileiros (Opções Binárias)
-
-Se você está procurando uma forma estável e profissional de automatizar suas estratégias na **IQ Option** usando Go, este é o cliente ideal. 
-
-- **Automação de Sinais**: Execute trades automaticamente baseados em seus indicadores.
-- **Conexão Resiliente**: Gerenciamento automático de sessão e retentativas em caso de falha de rede.
-- **Análise Técnica**: Recupere velas (candles) OHLC em tempo real para alimentar seus algoritmos.
-- **Suporte a MCP**: Compatível com o novo padrão de protocolos de contexto para IA e automação.
-
----
+> **Disclaimer:** `iqoption-mcp-go` is an independent, unofficial project and is not affiliated with, endorsed by, or sponsored by IQ Option. "IQ Option" is a trademark of its respective owner.
+>
+> Users are responsible for complying with IQ Option's Terms & Conditions, applicable laws, and any other requirements governing their use of the IQ Option service. Trading involves financial risk.
+>
+> Trading involves significant financial risk, and automated trading systems can result in substantial losses. Past performance does not guarantee future results.
 
 ## Key Features
 
-- ✅ **Account Management**: List and switch between Practice (Training) and Real (Normal) balances.
-- ✅ **Market Data**: List available assets, profit percentages, and real-time open/close status.
-- ✅ **Technical Analysis**: Retrieve OHLC candles (history and real-time) for any supported asset.
-- ✅ **Trading Operations**: Place Binary Options trades (CALL/PUT) with server-side expiration validation.
-- ✅ **Position Tracking**: Monitor open positions and retrieve full trade history.
-- ✅ **Resilience**: Built-in automatic retries for idempotent operations and seamless session recovery.
-- ✅ **Concurrency Safe**: Designed to be used in high-concurrency Go environments.
+- ✅ **Account Management:** List balances and work with Practice (Training) and Real (Normal) balances.
+- ✅ **Market Data:** List assets, profitability, availability, expirations, and OHLC candles.
+- ✅ **Technical Analysis:** Retrieve historical and real-time candle data with typed candle sizes.
+- ✅ **Trading Operations:** Place Binary Options trades using typed `CALL`/`PUT` directions.
+- ✅ **Position Management:** Look up positions, sell positions, and request rollovers where supported by the MCP server.
+- ✅ **Trade History:** List historical trades and retrieve a completed trade by position ID.
+- ✅ **Trade Waiting:** Wait for a position to finish and obtain its completed trade result.
+- ✅ **Rate-Limit Aware:** Discover server-provided limits and throttle gateway/read/write requests locally.
+- ✅ **Write-Safe Retries:** Read operations may retry after rate limiting; `place_trade`, `sell_position`, and `rollover_position` are treated as writes and are not retried automatically.
+- ✅ **Concurrency Safe:** Session initialization and session recovery are protected against common concurrent-use races.
+
+## Requirements
+
+- Access to an IQ Option MCP authentication token.
 
 ## Installation
 
 ```bash
-go get github.com/patrickkdev/iqoption-mcp-client
+go get github.com/patrickkdev/iqoption-mcp-go
 ```
 
 ## Quick Start
@@ -45,80 +44,93 @@ import (
 	"log"
 	"time"
 
-	iqclient "github.com/patrickkdev/iqoption-mcp-client"
+	"github.com/patrickkdev/iqoption-mcp-go"
 )
 
 func main() {
 	ctx := context.Background()
 
-	// Initialize the client with your IQ Option token
-	// You can obtain your token from the IQ Option MCP server or authorized portal.
-	client, err := iqclient.New(iqclient.Config{
+	// Initialize the client with your IQ Option MCP token.
+	client, err := iqoption.New(iqoption.Config{
 		Token: "YOUR_IQ_OPTION_TOKEN",
 	})
 	if err != nil {
-		log.Fatalf("Failed to create client: %v", err)
+		log.Fatalf("failed to create client: %v", err)
 	}
 	defer client.Close()
 
-	// 1. List Balances (e.g., Training balance)
-	balances, err := client.ListBalances(ctx, iqclient.BalanceTypeTraining)
+	// 1. List balances.
+	balances, err := client.ListBalances(ctx, iqoption.BalanceTypeTraining)
 	if err != nil {
-		log.Fatalf("Error listing balances: %v", err)
+		log.Fatalf("error listing balances: %v", err)
 	}
 
 	for _, b := range balances {
 		fmt.Printf("Balance [%s]: %.2f %s\n", b.Type, b.Amount, b.Currency)
 	}
 
-	// 2. Get Market Data (Candles)
-	// Asset 1 = EUR/USD (example)
-	candles, err := client.GetCandles(ctx, 1, 60, 10) // 10 candles of 1 minute (60s)
+	// 2. Get market data.
+	// Asset 1 is only an example; prefer an asset returned by ListAssets.
+	candles, err := client.GetCandles(
+		ctx,
+		1,
+		iqoption.CandleSize1Minute,
+		10,
+	)
 	if err != nil {
-		log.Fatalf("Error getting candles: %v", err)
+		log.Fatalf("error getting candles: %v", err)
 	}
 
 	for _, c := range candles {
 		fmt.Printf("Time: %v | Open: %f | Close: %f\n", c.From, c.Open, c.Close)
 	}
 
-	// 3. List Assets and available Expirations
+	// 3. List available assets and expirations.
 	assets, err := client.ListAssets(ctx, true)
 	if err != nil {
-		log.Fatalf("Error listing assets: %v", err)
+		log.Fatalf("error listing assets: %v", err)
 	}
-	for index, a := range assets {
-		fmt.Printf("Asset: %d %s (%d) | Expirations: %v\n", index, a.Name, a.ID, a.Expirations)
+	if len(assets) == 0 {
+		log.Fatal("no tradable assets returned by the server")
 	}
 
-	// 4. Place a Trade
-	targetAsset := assets[0] // Select target asset from available assets
-	result, err := client.PlaceTrade(ctx, iqclient.TradeRequest{
+	for _, a := range assets {
+		fmt.Printf("Asset: %s (%d) | Expirations: %v\n", a.Name, a.ID, a.Expirations)
+	}
+
+	targetAsset := assets[0]
+	if len(targetAsset.Expirations) == 0 {
+		log.Fatal("selected asset has no available expirations")
+	}
+
+	// 4. Place a trade.
+	// Trading writes are not automatically retried by the client.
+	positionID, err := client.PlaceTrade(ctx, iqoption.TradeRequest{
 		BalanceID:     balances[0].BalanceID,
 		AssetID:       targetAsset.ID,
-		Direction:     "call",
+		Direction:     iqoption.TradeDirectionCall,
 		Amount:        1.0,
 		ProfitPercent: targetAsset.ProfitPercent,
 		Expired:       targetAsset.Expirations[0],
 	})
 	if err != nil {
-		log.Fatalf("Error placing trade: %v", err)
+		log.Fatalf("error placing trade: %v", err)
 	}
 
-	fmt.Printf("Trade accepted: position_id=%d\n", result)
+	fmt.Printf("Trade accepted: position_id=%d\n", positionID)
 
-	// 5. Wait for Trade Outcome
+	// 5. Wait for the trade outcome.
 	tradeCtx, cancel := context.WithTimeout(ctx, 20*time.Minute)
 	defer cancel()
 
 	trade, err := client.WaitForTradeResult(
 		tradeCtx,
 		balances[0].BalanceID,
-		result,
+		positionID,
 		2*time.Second,
 	)
 	if err != nil {
-		log.Fatalf("Error waiting for trade result: %v", err)
+		log.Fatalf("error waiting for trade result: %v", err)
 	}
 
 	fmt.Printf(
@@ -131,63 +143,180 @@ func main() {
 }
 ```
 
-## Model Context Protocol (MCP)
+The example uses the typed constants `CandleSize1Minute` and `TradeDirectionCall` instead of arbitrary integers and strings.
 
-This client leverages the **Model Context Protocol**, allowing it to interact seamlessly with IQ Option MCP servers. This architecture ensures that complex business logic (like expiration calculations and protocol handshakes) is handled reliably by the upstream server while providing a type-safe, idiomatic Go experience for the developer.
+## Core API
 
-## Testing
+The v1 API includes helpers for the most common account, market-data, and trading workflows.
 
-The project includes integration tests to ensure the client communicates correctly with the IQ Option MCP server. By default, these tests are skipped unless the appropriate environment variables are set.
+### Market data and assets
 
-### Running Integration Tests
+```go
+assets, err := client.ListAssets(ctx, true)
 
-To run the integration tests, you need to configure your IQ Option test token and enable the tests via environment variables:
+asset, err := client.GetAssetByID(ctx, 1)
 
-```bash
-# Set your IQ Option token
-export IQOPTION_TEST_TOKEN="your_token_here"
+asset, err := client.GetAssetByName(ctx, "EUR/USD")
 
-# Enable general integration tests (read-only operations)
-export IQOPTION_LIVE_TEST=1
-
-# (Optional) Enable demo trading tests
-# WARNING: Only use this if you understand the risks.
-export IQOPTION_LIVE_TRADE=1
-
-# Run the tests
-go test -v ./...
+candles, err := client.GetCandles(
+	ctx,
+	asset.ID,
+	iqoption.CandleSize5Minutes,
+	100,
+)
 ```
 
-**Note:** 
-- `IQOPTION_LIVE_TEST` enables tests for listing balances, assets, candles, and history.
-- `IQOPTION_LIVE_TRADE` is required specifically for tests that place orders. These tests are designed to use **Practice (TRAINING)** balances.
-- Integration tests will be skipped if `IQOPTION_LIVE_TEST` is not set to `1`.
+### Positions and trade history
+
+```go
+position, err := client.GetPositionByID(ctx, positionID)
+
+trade, err := client.GetCompletedTradeByID(ctx, positionID)
+
+trade, err := client.WaitForTradeResult(
+	ctx,
+	balanceID,
+	positionID,
+	2*time.Second,
+)
+```
+
+### Trading lifecycle
+
+```go
+positionID, err := client.PlaceTrade(ctx, iqoption.TradeRequest{
+	BalanceID:     balanceID,
+	AssetID:       assetID,
+	Direction:     iqoption.TradeDirectionPut,
+	Amount:        1,
+	ProfitPercent: profitPercent,
+	Expired:       expiration,
+})
+
+err = client.SellPosition(ctx, balanceID, positionID)
+
+err = client.RolloverPosition(ctx, balanceID, positionID)
+```
+
+Trading mutation methods are deliberately treated as non-retryable writes. A transport failure after a write has been sent can be ambiguous, so the client does not automatically repeat the operation.
+
+## Rate Limiting
+
+The client is rate-limit aware and maintains separate local limits for:
+
+- **Gateway** requests.
+- **Read** operations.
+- **Write** operations.
+
+Server limits are discovered through the MCP `get_limits` operation. The client throttles requests locally to leave headroom and can interpret server rate-limit errors that provide retry metadata.
+
+For rate-limited **read** operations, the client may wait and retry up to `MaxRateLimitRetries` (default: `3`). Trading writes are not retried automatically.
+
+This means requests can be intentionally delayed even when an individual HTTP request would otherwise be accepted immediately.
+
+## MCP Transport and Session Lifecycle
+
+The client communicates with the upstream IQ Option MCP server using MCP/JSON-RPC over HTTP, including SSE responses where applicable.
+
+Session handling is intentionally conservative:
+
+1. `initialize` negotiates a session.
+2. The client sends `notifications/initialized` using that session.
+3. The session ID is published for normal use only after the full handshake succeeds.
+4. Concurrent initialization is serialized.
+5. Stale-session cleanup is guarded so an older request cannot clear a newer session.
+6. `Close()` clears session and rate-limit state.
+
+Tool results prefer MCP `structuredContent` and fall back to JSON contained in textual content when necessary.
+
+## Error Handling
+
+The client exposes structured errors for common transport and MCP failures, including a dedicated rate-limit error type.
+
+Rate-limit errors can expose information such as:
+
+- limit;
+- retry-after duration;
+- reset time;
+- the underlying MCP/HTTP error.
+
+Consumers that need to distinguish rate limiting can use `errors.Is(err, iqoption.ErrRateLimited)` and inspect the structured error when available.
 
 ## Advanced Usage
 
-### Customizing the HTTP Client
-You can provide your own `http.Client` for custom timeouts, proxy settings, or observability:
+### Customizing the HTTP client
+
+You can provide your own `http.Client` for custom timeouts, proxies, transports, or other HTTP behavior:
 
 ```go
-client, _ := iqclient.New(iqclient.Config{
-    Token: "...",
-    HTTPClient: &http.Client{
-        Timeout: 30 * time.Second,
-    },
+import "net/http"
+
+client, err := iqoption.New(iqoption.Config{
+	Token: "YOUR_IQ_OPTION_TOKEN",
+	HTTPClient: &http.Client{
+		Timeout: 30 * time.Second,
+	},
 })
 ```
 
-### Finding Expirations
-The library includes helpers to find valid expirations provided by the server, such as `FindM15Expiration`.
+### Finding expirations
+
+The library provides helpers for finding valid server-provided expirations, including helpers such as `FindM15Expiration`.
+
+## Testing
+
+The project includes unit tests for the client, error handling, rate limiting, and MCP decoding, plus integration tests for live IQ Option MCP behavior.
+
+Run the full unit-test suite with:
+
+```bash
+go test ./...
+```
+
+### Running Integration Tests
+
+Integration tests are skipped by default unless the required environment variables are configured.
+
+```bash
+# Set your IQ Option token.
+export IQOPTION_TEST_TOKEN="your_token_here"
+
+# Enable general read-only integration tests.
+export IQOPTION_LIVE_TEST=1
+
+# Optional: enable trade integration tests.
+# These tests are intended to use a Practice (TRAINING) balance.
+export IQOPTION_LIVE_TRADE=1
+
+go test -v ./...
+```
+
+`IQOPTION_LIVE_TEST=1` enables live tests for balances, assets, candles, positions, and history. `IQOPTION_LIVE_TRADE=1` enables tests that place or otherwise mutate trades and should only be used when you understand the financial and account-side effects.
+
+## Licensing
+
+This project is licensed under the **PolyForm Noncommercial License 1.0.0**, together with the project's **Personal Trading Exception**.
+
+The exception permits individuals to use the software for their own personal trading, including profitable personal trading, subject to the terms of the exception.
+
+The noncommercial license materially restricts commercial use and distribution. Review [`LICENSE`](./LICENSE) and [`LICENSE-EXCEPTION.md`](./LICENSE-EXCEPTION.md) before incorporating this library into a commercial product, paid service, SaaS offering, or software distributed to third parties.
+
+The `NOTICE` file contains the applicable attribution notice.
 
 ## Contributing
 
-Contributions are welcome! Feel free to open issues or submit pull requests to improve the client.
+Contributions are welcome. Please open an issue or pull request with a clear description of the change and its impact on the public API or trading behavior.
+
+## Develop a trading bot
+
+For developing a trading bot, [hire a trusted developer](https://patrick.makztech.com).
+
+🇧🇷 Para desenvolver um robô de trading, [contrate um desenvolvedor de confiança](https://patrick.makztech.com).
 
 ## Keywords
 
-`IQ Option API`, `Binary Options`, `Trading Bot`, `Golang`, `Go`, `MCP`, `Model Context Protocol`, `Algorithmic Trading`, `Fintech`, `Opções Binárias`, `Automação de Trades`, `Estratégia de Trading`.
+`IQ Option`, `MCP`, `Model Context Protocol`, `Golang`, `Go`, `Binary Options`, `Trading Bot`, `Algorithmic Trading`, `Market Data`, `Fintech`, `Opções Binárias`, `Automação de Trades`.
 
 ---
 
-*Disclaimer: Trading involves risk. Use this software at your own risk. The authors are not responsible for any financial losses incurred.*
+*Disclaimer: Trading involves risk. Use this software at your own risk. The authors are not responsible for financial losses incurred through use of this software.*

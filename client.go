@@ -1,13 +1,17 @@
-package iqclient
+package iqoption
 
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,13 +19,12 @@ import (
 )
 
 const (
-	DefaultEndpoint       = "https://binary-options.mcp.iqoption.com"
-	DefaultProtocol       = "2025-06-18"
-	DefaultClientName     = "iqoption-mcp-client"
-	DefaultClientVersion  = "1.0.0"
-	DefaultHTTPTimeout    = 60 * time.Second
-	DefaultMaxRetries     = 3
-	DefaultRetryBaseDelay = 500 * time.Millisecond
+	DefaultEndpoint            = "https://binary-options.mcp.iqoption.com"
+	DefaultProtocol            = "2025-06-18"
+	DefaultClientName          = "iqoption-mcp-client"
+	DefaultClientVersion       = "1.0.0"
+	DefaultHTTPTimeout         = 60 * time.Second
+	DefaultMaxRateLimitRetries = 3
 )
 
 // Config configures an IQ Option MCP client.
@@ -36,15 +39,10 @@ type Config struct {
 
 	HTTPClient *http.Client
 
-	MaxRetries     int
-	RetryBaseDelay time.Duration
-
-	// Optional hooks for observability.
-	OnRequest  func(method string)
-	OnResponse func(method string, duration time.Duration, err error)
+	MaxRateLimitRetries int
 }
 
-// Client is a resilient MCP client for the IQ Option MCP server.
+// Client is an MCP client for the IQ Option MCP server.
 //
 // Client is safe for concurrent use.
 type Client struct {
@@ -57,13 +55,24 @@ type Client struct {
 
 	httpClient *http.Client
 
-	maxRetries     int
-	retryBaseDelay time.Duration
+	// initMu serializes MCP session establishment.
+	//
+	// It must only protect session establishment. Calls made while holding
+	// this lock must never recursively call initialize().
+	initMu sync.Mutex
 
 	sessionMu sync.RWMutex
 	sessionID string
 
 	requestID atomic.Uint64
+
+	rateLimiter         *RateLimiter
+	maxRateLimitRetries int
+
+	// Rate-limit discovery is separate from MCP session initialization.
+	// This prevents GetLimits -> call -> initialize from deadlocking.
+	rateLimitsMu     sync.Mutex
+	rateLimitsLoaded atomic.Bool
 
 	closeOnce sync.Once
 	closed    atomic.Bool
@@ -75,7 +84,7 @@ type Client struct {
 // on the first request.
 func New(cfg Config) (*Client, error) {
 	if strings.TrimSpace(cfg.Token) == "" {
-		return nil, errors.New("iqclient: token is required")
+		return nil, errors.New("iqoption: token is required")
 	}
 
 	endpoint := strings.TrimSpace(cfg.Endpoint)
@@ -112,28 +121,20 @@ func New(cfg Config) (*Client, error) {
 		}
 	}
 
-	maxRetries := cfg.MaxRetries
-	if maxRetries < 0 {
-		maxRetries = 0
-	}
-	if maxRetries == 0 {
-		maxRetries = DefaultMaxRetries
-	}
-
-	retryDelay := cfg.RetryBaseDelay
-	if retryDelay <= 0 {
-		retryDelay = DefaultRetryBaseDelay
+	maxRateLimitRetries := cfg.MaxRateLimitRetries
+	if maxRateLimitRetries == 0 {
+		maxRateLimitRetries = DefaultMaxRateLimitRetries
 	}
 
 	return &Client{
-		endpoint:       endpoint,
-		token:          cfg.Token,
-		protocol:       protocol,
-		clientName:     clientName,
-		clientVersion:  clientVersion,
-		httpClient:     httpClient,
-		maxRetries:     maxRetries,
-		retryBaseDelay: retryDelay,
+		endpoint:            endpoint,
+		token:               cfg.Token,
+		protocol:            protocol,
+		clientName:          clientName,
+		clientVersion:       clientVersion,
+		httpClient:          httpClient,
+		rateLimiter:         NewRateLimiter(),
+		maxRateLimitRetries: maxRateLimitRetries,
 	}, nil
 }
 
@@ -144,6 +145,12 @@ func New(cfg Config) (*Client, error) {
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
+
+		c.sessionMu.Lock()
+		c.sessionID = ""
+		c.sessionMu.Unlock()
+
+		c.rateLimitsLoaded.Store(false)
 	})
 
 	return nil
@@ -155,7 +162,16 @@ func (c *Client) IsClosed() bool {
 }
 
 func (c *Client) nextRequestID() uint64 {
-	return c.requestID.Add(1)
+	var buf [8]byte
+
+	if _, err := rand.Read(buf[:]); err != nil {
+		// crypto/rand failure is extremely unlikely. Since this method
+		// currently cannot return an error, fall back to a timestamp-derived
+		// value rather than returning a predictable sequential ID.
+		return uint64(time.Now().UnixNano())
+	}
+
+	return binary.LittleEndian.Uint64(buf[:])
 }
 
 func (c *Client) getSessionID() string {
@@ -165,23 +181,110 @@ func (c *Client) getSessionID() string {
 	return c.sessionID
 }
 
-func (c *Client) setSessionID(id string) {
+func (c *Client) setSessionID(sessionID string) {
 	c.sessionMu.Lock()
-	defer c.sessionMu.Unlock()
-
-	c.sessionID = id
+	c.sessionID = sessionID
+	c.sessionMu.Unlock()
 }
 
-func (c *Client) clearSession() {
+// clearSession clears the current session only if it is still the expected
+// session. This prevents an old request from clearing a newly-established
+// session.
+func (c *Client) clearSession(expected string) bool {
 	c.sessionMu.Lock()
 	defer c.sessionMu.Unlock()
 
+	if c.sessionID != expected {
+		return false
+	}
+
 	c.sessionID = ""
+	c.rateLimitsLoaded.Store(false)
+
+	return true
+}
+
+func (c *Client) loadRateLimits(ctx context.Context) error {
+	c.rateLimitsMu.Lock()
+	defer c.rateLimitsMu.Unlock()
+
+	if c.rateLimitsLoaded.Load() {
+		return nil
+	}
+
+	if c.IsClosed() {
+		return ErrClosed
+	}
+
+	limits, err := c.GetLimits(ctx)
+	if err != nil {
+		return fmt.Errorf("load rate limits: %w", err)
+	}
+
+	gateway := 0
+	read := 0
+	write := 0
+
+	var (
+		gatewaySet bool
+		readSet    bool
+		writeSet   bool
+	)
+
+	for _, bucket := range limits {
+		if bucket.Limit < 0 {
+			return fmt.Errorf(
+				"invalid negative rate limit for bucket %q: %d",
+				bucket.Bucket,
+				bucket.Limit,
+			)
+		}
+
+		switch bucket.Bucket {
+		case "gateway":
+			gateway = bucket.Limit
+			gatewaySet = true
+
+		case "read":
+			read = bucket.Limit
+			readSet = true
+
+		case "write":
+			write = bucket.Limit
+			writeSet = true
+		}
+	}
+
+	// The server is expected to expose all three buckets. Do not silently
+	// convert a malformed response into zero-valued limits.
+	if !gatewaySet || !readSet || !writeSet {
+		return fmt.Errorf(
+			"incomplete rate-limit response: gateway=%t read=%t write=%t",
+			gatewaySet,
+			readSet,
+			writeSet,
+		)
+	}
+
+	c.rateLimiter.Update(RateLimits{
+		GatewayPerMinute: gateway,
+		ReadPerMinute:    read,
+		WritePerMinute:   write,
+	})
+
+	c.rateLimitsLoaded.Store(true)
+
+	return nil
 }
 
 // initialize establishes the MCP session.
 //
-// The IQ Option server currently advertises MCP protocol 2025-06-18.
+// The session ID is deliberately not published until the complete MCP
+// initialization sequence has succeeded:
+//
+//	initialize -> initialized notification -> publish session
+//
+// This prevents another goroutine from using a partially initialized session.
 func (c *Client) initialize(ctx context.Context) error {
 	if c.IsClosed() {
 		return ErrClosed
@@ -191,16 +294,18 @@ func (c *Client) initialize(ctx context.Context) error {
 		return nil
 	}
 
-	// Only serialize the initialization decision.
-	// Do NOT hold sessionMu while performing network I/O.
-	c.sessionMu.Lock()
+	c.initMu.Lock()
+	defer c.initMu.Unlock()
 
-	if c.sessionID != "" {
-		c.sessionMu.Unlock()
+	// Another goroutine may have initialized the session while we were
+	// waiting for initMu.
+	if c.getSessionID() != "" {
 		return nil
 	}
 
-	c.sessionMu.Unlock()
+	if c.IsClosed() {
+		return ErrClosed
+	}
 
 	params := InitializeParams{
 		ProtocolVersion: c.protocol,
@@ -211,14 +316,21 @@ func (c *Client) initialize(ctx context.Context) error {
 		},
 	}
 
-	result, sessionID, err := c.post(ctx, "initialize", params, false)
+	// No session ID is supplied for the initial initialize request.
+	result, sessionID, err := c.postWithSession(
+		ctx,
+		"initialize",
+		params,
+		false,
+		"",
+	)
 	if err != nil {
-		return fmt.Errorf("iqclient: initialize: %w", err)
+		return fmt.Errorf("iqoption: initialize: %w", err)
 	}
 
 	if sessionID == "" {
 		return errors.New(
-			"iqclient: initialize response did not contain mcp-session-id",
+			"iqoption: initialize response did not contain mcp-session-id",
 		)
 	}
 
@@ -226,40 +338,49 @@ func (c *Client) initialize(ctx context.Context) error {
 
 	if err := json.Unmarshal(result, &response); err != nil {
 		return fmt.Errorf(
-			"iqclient: decode initialize response: %w",
+			"iqoption: decode initialize response: %w",
 			err,
 		)
 	}
 
 	if response.ProtocolVersion == "" {
 		return errors.New(
-			"iqclient: server returned empty protocol version",
+			"iqoption: server returned empty protocol version",
 		)
 	}
 
-	// Store the session only after successful initialization.
-	c.sessionMu.Lock()
-	c.sessionID = sessionID
-	c.sessionMu.Unlock()
-
 	// MCP requires the initialized notification after initialization.
-	if _, _, err := c.post(
+	//
+	// Use the freshly returned session ID explicitly instead of publishing it
+	// to the client before the initialization sequence is complete.
+	if _, _, err := c.postWithSession(
 		ctx,
 		"notifications/initialized",
-		map[string]any{},
+		nil,
 		true,
+		sessionID,
 	); err != nil {
-		c.clearSession()
-
 		return fmt.Errorf(
-			"iqclient: initialized notification: %w",
+			"iqoption: initialized notification: %w",
 			err,
 		)
 	}
 
+	if c.IsClosed() {
+		return ErrClosed
+	}
+
+	c.setSessionID(sessionID)
+	c.rateLimitsLoaded.Store(false)
+
 	return nil
 }
 
+// call executes an MCP request.
+//
+// Session recovery is deliberately limited to read-only operations. Retrying
+// a side-effecting trading operation after an ambiguous transport/session
+// failure could execute the trade twice.
 func (c *Client) call(
 	ctx context.Context,
 	method string,
@@ -278,26 +399,25 @@ func (c *Client) call(
 		return result, nil
 	}
 
-	// A stale session should be recoverable.
-	if errors.Is(err, ErrSessionExpired) {
-		c.clearSession()
-
-		if initErr := c.initialize(ctx); initErr != nil {
-			return nil, fmt.Errorf(
-				"iqclient: session recovery failed: %w",
-				initErr,
-			)
-		}
-
-		result, _, retryErr := c.post(ctx, method, params, false)
-		if retryErr != nil {
-			return nil, retryErr
-		}
-
-		return result, nil
+	if !errors.Is(err, ErrSessionExpired) {
+		return nil, err
 	}
 
-	return nil, err
+	oldSessionID := c.getSessionID()
+	if oldSessionID == "" {
+		return nil, err
+	}
+
+	c.clearSession(oldSessionID)
+
+	if initErr := c.initialize(ctx); initErr != nil {
+		return nil, fmt.Errorf(
+			"iqoption: session recovery failed: %w",
+			initErr,
+		)
+	}
+
+	return nil, ErrSessionExpired
 }
 
 func (c *Client) callTool(
@@ -305,111 +425,121 @@ func (c *Client) callTool(
 	tool string,
 	arguments map[string]any,
 ) ([]byte, error) {
-	result, err := c.call(
-		ctx,
-		"tools/call",
-		ToolCallParams{
-			Name:      tool,
-			Arguments: arguments,
-		},
-	)
-	if err != nil {
-		return nil, err
+	if tool != getLimitsToolName {
+		if err := c.loadRateLimits(ctx); err != nil {
+			return nil, err
+		}
 	}
 
-	return decodeMCPToolResult(result)
-}
+	for attempt := 0; attempt <= c.maxRateLimitRetries; attempt++ {
+		if err := c.waitRateLimit(ctx, tool); err != nil {
+			return nil, err
+		}
 
-func decodeMCPToolResult(result []byte) ([]byte, error) {
-	var response MCPToolResult
-
-	if err := json.Unmarshal(result, &response); err != nil {
-		return nil, fmt.Errorf(
-			"decode MCP tool response: %w",
-			err,
+		result, err := c.call(
+			ctx,
+			"tools/call",
+			ToolCallParams{
+				Name:      tool,
+				Arguments: arguments,
+			},
 		)
-	}
 
-	if response.IsError {
-		for _, content := range response.Content {
-			if content.Type != "text" {
-				continue
-			}
-
-			message := strings.TrimSpace(content.Text)
-			if message == "" {
-				continue
-			}
-
-			return nil, &MCPError{
-				Message: message,
-			}
+		if err == nil {
+			result, err = decodeMCPToolResult(result)
 		}
 
-		return nil, &MCPError{
-			Message: "MCP tool returned an error",
-		}
-	}
-
-	// Current IQ Option MCP server provides structuredContent.
-	if len(response.StructuredContent) > 0 &&
-		string(response.StructuredContent) != "null" {
-		return response.StructuredContent, nil
-	}
-
-	// Fallback for MCP servers that only provide text content.
-	for _, content := range response.Content {
-		if content.Type != "text" {
-			continue
+		if err == nil {
+			return result, nil
 		}
 
-		text := strings.TrimSpace(content.Text)
+		var rateLimitErr *RateLimitError
+		if !errors.As(err, &rateLimitErr) {
+			log.Printf("unexpected error: %v", err)
+			return nil, err
+		}
 
-		if text != "" && json.Valid([]byte(text)) {
-			return []byte(text), nil
+		// Never retry writes.
+		if c.toolIsWrite(tool) {
+			return nil, err
+		}
+
+		if attempt >= c.maxRateLimitRetries {
+			return nil, err
+		}
+
+		log.Printf("rate limited: waiting %f before retrying", rateLimitErr.RetryAfter.Seconds())
+		if err := waitRateLimitError(
+			ctx,
+			rateLimitErr,
+		); err != nil {
+			return nil, err
 		}
 	}
 
-	return nil, errors.New(
-		"no JSON content found in MCP tool response",
-	)
+	return nil, errors.New("rate limit retry loop exhausted")
 }
 
-func decodeMCPToolError(
-	result MCPToolResult,
+func (c *Client) waitRateLimit(ctx context.Context, tool string) error {
+	var waitFunc func(context.Context) error
+
+	if c.toolIsWrite(tool) {
+		waitFunc = c.rateLimiter.WaitWrite
+	} else {
+		waitFunc = c.rateLimiter.WaitRead
+	}
+
+	return waitFunc(ctx)
+}
+
+func waitRateLimitError(
+	ctx context.Context,
+	err *RateLimitError,
 ) error {
-	for _, content := range result.Content {
-		if content.Type == "text" {
-			message := strings.TrimSpace(content.Text)
+	delay := err.RetryAfter
 
-			if message != "" {
-				return &MCPError{
-					Message: message,
-				}
-			}
-		}
+	if delay <= 0 && !err.ResetAt.IsZero() {
+		delay = time.Until(err.ResetAt)
 	}
 
-	return &MCPError{
-		Message: "MCP tool returned an error",
+	if delay <= 0 {
+		delay = time.Second
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
-// post sends one MCP JSON-RPC request.
-//
-// IMPORTANT:
-// retryable controls whether the request itself can safely be retried.
-//
-// We deliberately do NOT retry mutations such as place_trade. A network
-// timeout after a successful trade must never result in a second trade.
+// post sends one MCP JSON-RPC request using the currently active session.
 func (c *Client) post(
 	ctx context.Context,
 	method string,
 	params any,
 	notification bool,
 ) ([]byte, string, error) {
-	requestID := c.nextRequestID()
+	return c.postWithSession(
+		ctx,
+		method,
+		params,
+		notification,
+		c.getSessionID(),
+	)
+}
 
+func (c *Client) postWithSession(
+	ctx context.Context,
+	method string,
+	params any,
+	notification bool,
+	sessionID string,
+) ([]byte, string, error) {
 	request := JSONRPCRequest{
 		JSONRPC: "2.0",
 		Method:  method,
@@ -417,7 +547,7 @@ func (c *Client) post(
 	}
 
 	if !notification {
-		request.ID = requestID
+		request.ID = c.nextRequestID()
 	}
 
 	body, err := json.Marshal(request)
@@ -425,56 +555,27 @@ func (c *Client) post(
 		return nil, "", fmt.Errorf("encode request: %w", err)
 	}
 
-	var lastErr error
+	return c.doHTTP(ctx, body, sessionID)
+}
 
-	attempts := 1
-	if !notification && isRetryableMCPMethod(method) {
-		attempts += c.maxRetries
+func (c *Client) toolIsWrite(tool string) bool {
+	switch tool {
+	case "place_trade", "rollover_position", "sell_position":
+		return true
+	default:
+		return false
 	}
-
-	for attempt := 0; attempt < attempts; attempt++ {
-		if attempt > 0 {
-			delay := c.retryBaseDelay * time.Duration(1<<(attempt-1))
-
-			if err := sleepContext(ctx, delay); err != nil {
-				return nil, "", err
-			}
-		}
-
-		start := time.Now()
-
-		if err := c.notifyRequest(method); err != nil {
-			return nil, "", err
-		}
-
-		result, sessionID, err := c.doHTTP(ctx, body)
-
-		if c.notifyResponse(method, time.Since(start), err); err != nil {
-			return nil, "", err
-		}
-
-		if err == nil {
-			return result, sessionID, nil
-		}
-
-		lastErr = err
-
-		if !isRetryableError(err) {
-			break
-		}
-	}
-
-	return nil, "", fmt.Errorf(
-		"mcp request %q failed after retries: %w",
-		method,
-		lastErr,
-	)
 }
 
 func (c *Client) doHTTP(
 	ctx context.Context,
 	body []byte,
+	sessionID string,
 ) ([]byte, string, error) {
+	if c.IsClosed() {
+		return nil, "", ErrClosed
+	}
+
 	req, err := http.NewRequestWithContext(
 		ctx,
 		http.MethodPost,
@@ -492,7 +593,7 @@ func (c *Client) doHTTP(
 		"application/json, text/event-stream",
 	)
 
-	if sessionID := c.getSessionID(); sessionID != "" {
+	if sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", sessionID)
 	}
 
@@ -507,29 +608,30 @@ func (c *Client) doHTTP(
 	}
 	defer resp.Body.Close()
 
-	sessionID := resp.Header.Get("Mcp-Session-Id")
+	responseSessionID := resp.Header.Get("Mcp-Session-Id")
 
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, sessionID, fmt.Errorf("read HTTP response: %w", err)
+		return nil, responseSessionID, fmt.Errorf(
+			"read HTTP response: %w",
+			err,
+		)
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized ||
-		resp.StatusCode == http.StatusForbidden {
-		return nil, sessionID, fmt.Errorf(
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return nil, responseSessionID, fmt.Errorf(
 			"%w: HTTP %d",
 			ErrUnauthorized,
 			resp.StatusCode,
 		)
-	}
 
-	if resp.StatusCode == http.StatusNotFound ||
-		resp.StatusCode == http.StatusGone {
-		return nil, sessionID, ErrSessionExpired
+	case http.StatusNotFound, http.StatusGone:
+		return nil, responseSessionID, ErrSessionExpired
 	}
 
 	if resp.StatusCode >= 500 {
-		return nil, sessionID, fmt.Errorf(
+		return nil, responseSessionID, fmt.Errorf(
 			"%w: HTTP %d: %s",
 			ErrServerUnavailable,
 			resp.StatusCode,
@@ -538,15 +640,16 @@ func (c *Client) doHTTP(
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, sessionID, fmt.Errorf(
+		return nil, responseSessionID, fmt.Errorf(
 			"HTTP %d: %s",
 			resp.StatusCode,
 			summarizeBody(responseBody),
 		)
 	}
 
+	// Streamable HTTP notifications are allowed to return an empty body.
 	if len(bytes.TrimSpace(responseBody)) == 0 {
-		return nil, sessionID, nil
+		return nil, responseSessionID, nil
 	}
 
 	contentType := resp.Header.Get("Content-Type")
@@ -556,26 +659,69 @@ func (c *Client) doHTTP(
 
 	result, err := decodeMCPResponse(responseBody, contentType)
 	if err != nil {
-		return nil, sessionID, err
+		return nil, responseSessionID, err
 	}
 
 	var rpc JSONRPCResponse
 	if err := json.Unmarshal(result, &rpc); err != nil {
-		return nil, sessionID, fmt.Errorf(
+		return nil, responseSessionID, fmt.Errorf(
 			"decode JSON-RPC response: %w",
 			err,
 		)
 	}
 
 	if rpc.Error != nil {
-		return nil, sessionID, &MCPError{
+		mcpErr := &MCPError{
 			Code:    rpc.Error.Code,
 			Message: rpc.Error.Message,
 			Data:    rpc.Error.Data,
 		}
+
+		if mcpErr.Is(ErrRateLimited) {
+			rateLimitErr, err := mcpErr.AsRateLimitError()
+			if err != nil {
+				return nil, responseSessionID, err
+			}
+
+			return nil, responseSessionID, rateLimitErr
+		}
+
+		return nil, responseSessionID, mcpErr
 	}
 
-	return rpc.Result, sessionID, nil
+	return rpc.Result, responseSessionID, nil
+}
+
+func newRateLimitError(
+	retryAfter string,
+	message string,
+) *RateLimitError {
+	err := &RateLimitError{
+		Message: message,
+	}
+
+	retryAfter = strings.TrimSpace(retryAfter)
+	if retryAfter == "" {
+		return err
+	}
+
+	// Retry-After may be a number of seconds.
+	if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil {
+		if seconds >= 0 {
+			err.RetryAfter = time.Duration(seconds) * time.Second
+		}
+
+		return err
+	}
+
+	// Or an HTTP date.
+	if when, parseErr := http.ParseTime(retryAfter); parseErr == nil {
+		if duration := time.Until(when); duration > 0 {
+			err.RetryAfter = duration
+		}
+	}
+
+	return err
 }
 
 func decodeMCPResponse(
@@ -602,99 +748,8 @@ func decodeMCPResponse(
 	return nil, fmt.Errorf(
 		"invalid MCP response: content-type=%q body=%q",
 		contentType,
-		string(body),
+		summarizeBody(body),
 	)
-}
-
-func decodeMCPJSON(body []byte) ([]byte, error) {
-	var envelope struct {
-		JSONRPC string `json:"jsonrpc"`
-		ID      any    `json:"id"`
-
-		Result json.RawMessage `json:"result"`
-		Error  json.RawMessage `json:"error"`
-	}
-
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, fmt.Errorf(
-			"decode MCP JSON response: %w",
-			err,
-		)
-	}
-
-	if len(envelope.Error) > 0 &&
-		string(envelope.Error) != "null" {
-		var mcpErr MCPError
-
-		if err := json.Unmarshal(envelope.Error, &mcpErr); err != nil {
-			return nil, fmt.Errorf(
-				"decode MCP error: %w",
-				err,
-			)
-		}
-
-		return nil, &mcpErr
-	}
-
-	if len(envelope.Result) == 0 ||
-		string(envelope.Result) == "null" {
-		return nil, errors.New(
-			"MCP response contains no result",
-		)
-	}
-
-	// First, return the result directly if it isn't a
-	// normal tools/call result envelope.
-	//
-	// tools/call normally contains:
-	//
-	// {
-	//   "content": [
-	//     {
-	//       "type": "text",
-	//       "text": "[...]"
-	//     }
-	//   ]
-	// }
-	var result struct {
-		Content           []MCPContent    `json:"content"`
-		StructuredContent json.RawMessage `json:"structuredContent"`
-		IsError           bool            `json:"isError"`
-	}
-
-	if err := json.Unmarshal(envelope.Result, &result); err != nil {
-		return nil, fmt.Errorf(
-			"decode MCP result: %w",
-			err,
-		)
-	}
-
-	if len(result.StructuredContent) > 0 &&
-		string(result.StructuredContent) != "null" {
-		return result.StructuredContent, nil
-	}
-
-	for _, content := range result.Content {
-		if content.Type != "text" {
-			continue
-		}
-
-		text := strings.TrimSpace(content.Text)
-
-		if text == "" {
-			continue
-		}
-
-		// IQ Option's MCP server puts the actual tool JSON
-		// inside the text field.
-		if json.Valid([]byte(text)) {
-			return []byte(text), nil
-		}
-	}
-
-	// If this wasn't a tools/call-style response, return
-	// the raw result so callers can decode it themselves.
-	return envelope.Result, nil
 }
 
 func decodeMCPSSE(body []byte) ([]byte, error) {
@@ -708,10 +763,11 @@ func decodeMCPSSE(body []byte) ([]byte, error) {
 	)
 
 	var dataLines []string
+	var sawEvent bool
 
-	flush := func() ([]byte, bool) {
+	flush := func() ([]byte, bool, error) {
 		if len(dataLines) == 0 {
-			return nil, false
+			return nil, false, nil
 		}
 
 		data := strings.TrimSpace(
@@ -721,36 +777,64 @@ func decodeMCPSSE(body []byte) ([]byte, error) {
 		dataLines = nil
 
 		if data == "" || data == "[DONE]" {
-			return nil, false
+			return nil, false, nil
 		}
 
 		if !json.Valid([]byte(data)) {
-			return nil, false
+			return nil, false, fmt.Errorf(
+				"invalid JSON in MCP SSE data: %q",
+				summarizeBody([]byte(data)),
+			)
 		}
 
-		return []byte(data), true
+		return []byte(data), true, nil
 	}
 
 	for _, line := range lines {
-		if strings.HasPrefix(line, "data:") {
+		// SSE comments/metadata.
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+
+		if after, ok := strings.CutPrefix(line, "data:"); ok {
+			sawEvent = true
+
+			// SSE permits an optional single leading space after ":".
 			dataLines = append(
 				dataLines,
-				strings.TrimSpace(
-					strings.TrimPrefix(line, "data:"),
-				),
+				strings.TrimPrefix(after, " "),
 			)
 			continue
 		}
 
+		// A blank line terminates an SSE event.
 		if line == "" {
-			if result, ok := flush(); ok {
+			result, ok, err := flush()
+			if err != nil {
+				return nil, err
+			}
+
+			if ok {
 				return result, nil
 			}
+
+			continue
 		}
 	}
 
-	if result, ok := flush(); ok {
+	result, ok, err := flush()
+	if err != nil {
+		return nil, err
+	}
+
+	if ok {
 		return result, nil
+	}
+
+	if !sawEvent {
+		return nil, errors.New(
+			"no SSE data events found in MCP response",
+		)
 	}
 
 	return nil, errors.New(
@@ -758,40 +842,12 @@ func decodeMCPSSE(body []byte) ([]byte, error) {
 	)
 }
 
-func isRetryableMCPMethod(method string) bool {
-	switch method {
-	case "initialize",
-		"tools/list",
-		"tools/call":
-		return true
-	default:
-		return false
-	}
-}
-
-func isRetryableError(err error) bool {
-	return errors.Is(err, ErrNetwork) ||
-		errors.Is(err, ErrServerUnavailable)
-}
-
 func classifyNetworkError(err error) error {
 	if err == nil {
 		return nil
 	}
 
-	return fmt.Errorf("%w: %v", ErrNetwork, err)
-}
-
-func sleepContext(ctx context.Context, duration time.Duration) error {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	return fmt.Errorf("%w: %w", ErrNetwork, err)
 }
 
 func summarizeBody(body []byte) string {
@@ -804,16 +860,4 @@ func summarizeBody(body []byte) string {
 	}
 
 	return text
-}
-
-func (c *Client) notifyRequest(method string) error {
-	return nil
-}
-
-func (c *Client) notifyResponse(
-	method string,
-	duration time.Duration,
-	err error,
-) error {
-	return nil
 }

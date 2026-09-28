@@ -1,3 +1,5 @@
-module github.com/patrickkdev/iqoption-mcp-client
+module github.com/patrickkdev/iqoption-mcp-go
 
 go 1.27.0
+
+require golang.org/x/time v0.16.0
