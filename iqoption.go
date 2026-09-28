@@ -1,4 +1,4 @@
-package iqclient
+package iqoption
 
 import (
 	"context"
@@ -14,6 +14,13 @@ func (c *Client) ListBalances(
 	ctx context.Context,
 	types BalanceType,
 ) ([]AccountBalance, error) {
+	switch types {
+	case BalanceTypeAll, BalanceTypeNormal, BalanceTypeTraining:
+		// valid
+	default:
+		return nil, fmt.Errorf("unsupported balance type: %s", types)
+	}
+
 	result, err := c.callTool(
 		ctx,
 		"list_balances",
@@ -87,7 +94,7 @@ func (c *Client) ListAssets(
 		for _, unix := range row.Expirations {
 			asset.Expirations = append(
 				asset.Expirations,
-				time.Unix(unix, 0).UTC(),
+				time.Unix(unix, 0),
 			)
 		}
 
@@ -104,15 +111,19 @@ func (c *Client) ListAssets(
 func (c *Client) GetCandles(
 	ctx context.Context,
 	assetID int64,
-	size int,
+	size CandleSize,
 	count int,
 ) ([]Candle, error) {
 	if assetID <= 0 {
-		return nil, errors.New("get candles: assetID must be positive")
+		return nil, errors.New("get candles: invalid assetID")
 	}
 
 	if count <= 0 {
-		return nil, errors.New("get candles: count must be positive")
+		return nil, errors.New("get candles: invalid count")
+	}
+
+	if size <= 0 {
+		return nil, errors.New("get candles: invalid size")
 	}
 
 	if count > 1000 {
@@ -144,8 +155,8 @@ func (c *Client) GetCandles(
 
 	for _, row := range payload.Candles {
 		candles = append(candles, Candle{
-			From:   row.From.UTC(),
-			To:     row.To.UTC(),
+			From:   row.From,
+			To:     row.To,
 			Open:   row.Open,
 			Close:  row.Close,
 			High:   row.High,
@@ -155,6 +166,208 @@ func (c *Client) GetCandles(
 	}
 
 	return candles, nil
+}
+
+func find[T any](
+	items []T,
+	match func(T) bool,
+) (T, bool) {
+	for _, item := range items {
+		if match(item) {
+			return item, true
+		}
+	}
+
+	var zero T
+	return zero, false
+}
+
+// GetPositionByID returns an open position by ID.
+func (c *Client) GetPositionByID(
+	ctx context.Context,
+	positionID int64,
+	balanceID int64,
+) (*Position, bool, error) {
+	positions, err := c.ListPositions(ctx, balanceID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	position, found := find(positions, func(position Position) bool {
+		return position.PositionID == positionID
+	})
+
+	if !found {
+		return nil, false, nil
+	}
+
+	return &position, true, nil
+}
+
+// GetAssetByID returns an asset by ID.
+func (c *Client) GetAssetByID(
+	ctx context.Context,
+	assetID int64,
+) (*Asset, bool, error) {
+	assets, err := c.ListAssets(ctx, false)
+	if err != nil {
+		return nil, false, err
+	}
+
+	asset, found := find(assets, func(asset Asset) bool {
+		return asset.ID == assetID
+	})
+
+	if !found {
+		return nil, false, nil
+	}
+
+	return &asset, true, nil
+}
+
+// GetAssetByName returns an asset matching name.
+//
+// Matching is intentionally forgiving: case, whitespace, separators and
+// other non-alphanumeric characters are ignored.
+func (c *Client) GetAssetByName(
+	ctx context.Context,
+	name string,
+) (*Asset, bool, error) {
+	assets, err := c.ListAssets(ctx, false)
+	if err != nil {
+		return nil, false, err
+	}
+
+	target := cleanAssetName(name)
+	if target == "" {
+		return nil, false, nil
+	}
+
+	asset, found := find(assets, func(asset Asset) bool {
+		return cleanAssetName(asset.Name) == target
+	})
+
+	if !found {
+		return nil, false, nil
+	}
+
+	return &asset, true, nil
+}
+
+func cleanAssetName(name string) string {
+	var b strings.Builder
+	b.Grow(len(name))
+
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') ||
+			(r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+
+	return b.String()
+}
+
+// GetHistoryByID returns a completed trade by position ID.
+//
+// History is paginated until the trade is found or there are no more items.
+func (c *Client) GetCompletedTradeByID(
+	ctx context.Context,
+	positionID int64,
+) (*Trade, bool, error) {
+	const pageSize = 100
+
+	for skip := 0; ; skip += pageSize {
+		history, err := c.ListTradeHistory(ctx, skip, pageSize)
+		if err != nil {
+			return nil, false, err
+		}
+
+		trade, found := find(history, func(trade Trade) bool {
+			return trade.PositionID == positionID
+		})
+
+		if found {
+			return &trade, true, nil
+		}
+
+		if len(history) < pageSize {
+			return nil, false, nil
+		}
+	}
+}
+
+func (c *Client) WaitForTradeResult(
+	ctx context.Context,
+	balanceID int64,
+	positionID int64,
+) (Trade, error) {
+	if balanceID <= 0 {
+		return Trade{}, fmt.Errorf("invalid balanceID")
+	}
+
+	if positionID <= 0 {
+		return Trade{}, fmt.Errorf("invalid positionID")
+	}
+
+	position, exists, err := c.GetPositionByID(ctx, balanceID, positionID)
+	if err != nil {
+		return Trade{}, fmt.Errorf("check trade position: %w", err)
+	}
+
+	if exists {
+		if err := c.waitUntil(ctx, position.Expiration); err != nil {
+			return Trade{}, fmt.Errorf("wait for trade expiration: %w", err)
+		}
+	}
+
+	return c.waitForTradeHistory(ctx, positionID)
+}
+
+func (c *Client) waitUntil(ctx context.Context, t time.Time) error {
+	wait := time.Until(t)
+
+	if wait <= 0 {
+		return nil
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (c *Client) waitForTradeHistory(
+	ctx context.Context,
+	positionID int64,
+) (Trade, error) {
+	for {
+		if ctx.Err() != nil {
+			return Trade{}, fmt.Errorf("context error: %w", ctx.Err())
+		}
+
+		history, err := c.ListTradeHistory(ctx, 0, 50) // 50 should be enough to find the trade
+		if err != nil {
+			return Trade{}, fmt.Errorf(
+				"check trade history %d: %w",
+				positionID,
+				err,
+			)
+		}
+
+		trade, found := find(history, func(trade Trade) bool {
+			return trade.PositionID == positionID
+		})
+
+		if found {
+			return trade, nil
+		}
+	}
 }
 
 // ListPositions returns currently open positions for a balance.
@@ -199,8 +412,8 @@ func (c *Client) ListPositions(
 			CurrentPrice:     row.CurrentPrice,
 			ExpectedProfit:   row.ExpectedProfit,
 			SellProfit:       row.SellProfit,
-			OpenTime:         row.OpenTime.UTC(),
-			Expiration:       row.Expiration.UTC(),
+			OpenTime:         row.OpenTime,
+			Expiration:       row.Expiration,
 			SecondsRemaining: row.SecondsRemaining,
 		})
 	}
@@ -254,8 +467,8 @@ func (c *Client) ListTradeHistory(
 			OpenPrice:   row.OpenPrice,
 			ClosePrice:  row.ClosePrice,
 			Profit:      row.Profit,
-			OpenTime:    row.OpenTime.UTC(),
-			CloseTime:   row.CloseTime.UTC(),
+			OpenTime:    row.OpenTime,
+			CloseTime:   row.CloseTime,
 			CloseReason: row.CloseReason,
 			Result:      row.Result,
 		})
@@ -265,13 +478,6 @@ func (c *Client) ListTradeHistory(
 }
 
 // PlaceTrade submits a trade.
-//
-// IMPORTANT:
-//
-// This method intentionally does not retry.
-//
-// A timeout after the server accepted the trade is ambiguous. Retrying could
-// create a duplicate trade.
 //
 // For REAL/regular balances, the upstream MCP server requires explicit user
 // confirmation before the write. This package does not bypass that requirement.
@@ -287,9 +493,7 @@ func (c *Client) PlaceTrade(
 		return 0, errors.New("place trade: assetID must be positive")
 	}
 
-	direction := strings.ToLower(strings.TrimSpace(req.Direction))
-
-	if direction != "call" && direction != "put" {
+	if req.Direction != TradeDirectionCall && req.Direction != TradeDirectionPut {
 		return 0, fmt.Errorf(
 			"place trade: invalid direction %q",
 			req.Direction,
@@ -312,13 +516,13 @@ func (c *Client) PlaceTrade(
 		)
 	}
 
-	result, err := c.postToolCallNoRetry(
+	result, err := c.callTool(
 		ctx,
 		"place_trade",
 		map[string]any{
 			"balance_id":     req.BalanceID,
 			"asset_id":       req.AssetID,
-			"direction":      direction,
+			"direction":      req.Direction,
 			"amount":         req.Amount,
 			"profit_percent": req.ProfitPercent,
 			"expired":        req.Expired.Unix(),
@@ -339,6 +543,97 @@ func (c *Client) PlaceTrade(
 	if response.PositionID <= 0 {
 		return 0, errors.New(
 			"place trade: server returned invalid position_id",
+		)
+	}
+
+	return response.PositionID, nil
+}
+
+// SellPosition closes an open position early at the current buyback price.
+//
+// This is a destructive write operation. The caller should ensure that the
+// position is eligible for early sale before calling this method.
+func (c *Client) SellPosition(
+	ctx context.Context,
+	positionID int64,
+) error {
+	if positionID <= 0 {
+		return errors.New(
+			"sell position: positionID must be positive",
+		)
+	}
+
+	_, err := c.callTool(
+		ctx,
+		"sell_position",
+		map[string]any{
+			"position_id": positionID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"sell position %d: %w",
+			positionID,
+			err,
+		)
+	}
+
+	return nil
+}
+
+// RolloverPosition moves an open losing position to the next expiration
+// window.
+//
+// expirationTime must be the position's current expiration timestamp,
+// expressed as Unix seconds. The timestamp should come directly from the
+// position returned by ListPositions.
+func (c *Client) RolloverPosition(
+	ctx context.Context,
+	positionID int64,
+	expirationTime time.Time,
+) (int64, error) {
+	if positionID <= 0 {
+		return 0, errors.New(
+			"rollover position: positionID must be positive",
+		)
+	}
+
+	if expirationTime.IsZero() {
+		return 0, errors.New(
+			"rollover position: expirationTime is required",
+		)
+	}
+
+	result, err := c.callTool(
+		ctx,
+		"rollover_position",
+		map[string]any{
+			"position_id":     positionID,
+			"expiration_time": expirationTime.Unix(),
+		},
+	)
+	if err != nil {
+		return 0, fmt.Errorf(
+			"rollover position %d: %w",
+			positionID,
+			err,
+		)
+	}
+
+	var response struct {
+		PositionID int64 `json:"position_id"`
+	}
+
+	if err := json.Unmarshal(result, &response); err != nil {
+		return 0, fmt.Errorf(
+			"decode rollover position result: %w",
+			err,
+		)
+	}
+
+	if response.PositionID <= 0 {
+		return 0, errors.New(
+			"rollover position: server returned invalid position_id",
 		)
 	}
 
@@ -370,292 +665,31 @@ func (c *Client) GetCapabilities(
 	return capabilities, nil
 }
 
+const getLimitsToolName = "get_limits"
+
 // GetLimits retrieves server limits.
 func (c *Client) GetLimits(
 	ctx context.Context,
-) (map[string]any, error) {
+) ([]LimitBuckets, error) {
 	result, err := c.callTool(
 		ctx,
-		"get_limits",
-		map[string]any{},
+		getLimitsToolName,
+		nil,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("get limits: %w", err)
 	}
 
-	var limits map[string]any
-
+	var limits GetLimitsResponse
 	if err := json.Unmarshal(result, &limits); err != nil {
 		return nil, fmt.Errorf("decode limits: %w", err)
 	}
 
-	return limits, nil
+	return limits.Buckets, nil
 }
 
 func (c *Client) ListTools(ctx context.Context) ([]byte, error) {
 	result, err := c.call(ctx, "tools/list", map[string]any{})
-	if err != nil {
-		return nil, err
-	}
-
-	return result, nil
-}
-
-func (c *Client) WaitForTradeResult(
-	ctx context.Context,
-	balanceID int64,
-	positionID int64,
-	pollInterval time.Duration,
-) (*Trade, error) {
-	if balanceID <= 0 {
-		return nil, fmt.Errorf("balance ID must be positive")
-	}
-
-	if positionID <= 0 {
-		return nil, fmt.Errorf("position ID must be positive")
-	}
-
-	if pollInterval <= 0 {
-		pollInterval = 2 * time.Second
-	}
-
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-
-	// Check immediately instead of waiting for the first ticker tick.
-	open, err := c.positionExists(ctx, balanceID, positionID)
-	if err != nil {
-		return nil, fmt.Errorf("check trade position: %w", err)
-	}
-
-	if !open {
-		return c.waitForTradeHistory(ctx, positionID, pollInterval)
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf(
-				"waiting for trade %d: %w",
-				positionID,
-				ctx.Err(),
-			)
-
-		case <-ticker.C:
-			open, err := c.positionExists(ctx, balanceID, positionID)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"check trade position %d: %w",
-					positionID,
-					err,
-				)
-			}
-
-			if !open {
-				return c.waitForTradeHistory(
-					ctx,
-					positionID,
-					pollInterval,
-				)
-			}
-		}
-	}
-}
-
-func (c *Client) positionExists(
-	ctx context.Context,
-	balanceID int64,
-	positionID int64,
-) (bool, error) {
-	positions, err := c.ListPositions(ctx, balanceID)
-	if err != nil {
-		return false, err
-	}
-
-	for _, position := range positions {
-		if position.PositionID == positionID {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-func (c *Client) waitForTradeHistory(
-	ctx context.Context,
-	positionID int64,
-	pollInterval time.Duration,
-) (*Trade, error) {
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-
-	// Check immediately because the history may already have been updated.
-	trade, found, err := c.findTradeInHistory(ctx, positionID)
-	if err != nil {
-		return nil, fmt.Errorf(
-			"check trade history %d: %w",
-			positionID,
-			err,
-		)
-	}
-
-	if found {
-		return trade, nil
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf(
-				"waiting for completed trade %d: %w",
-				positionID,
-				ctx.Err(),
-			)
-
-		case <-ticker.C:
-			trade, found, err := c.findTradeInHistory(ctx, positionID)
-			if err != nil {
-				return nil, fmt.Errorf(
-					"check trade history %d: %w",
-					positionID,
-					err,
-				)
-			}
-
-			if found {
-				return trade, nil
-			}
-		}
-	}
-}
-
-func (c *Client) findTradeInHistory(
-	ctx context.Context,
-	positionID int64,
-) (*Trade, bool, error) {
-	// 100 should be plenty for finding a just-completed trade.
-	history, err := c.ListTradeHistory(ctx, 0, 100)
-	if err != nil {
-		return nil, false, err
-	}
-
-	for i := range history {
-		if history[i].PositionID == positionID {
-			return &history[i], true, nil
-		}
-	}
-
-	return nil, false, nil
-}
-
-// FindM15Expiration returns the server-provided expiration closest to 15
-// minutes from now.
-//
-// It NEVER calculates an expiration timestamp itself.
-//
-// This is important because the MCP server owns the valid expiration values.
-func FindM15Expiration(
-	asset Asset,
-	now time.Time,
-) (time.Time, bool) {
-	const target = 15 * time.Minute
-
-	now = now.UTC()
-
-	var (
-		best      time.Time
-		bestDelta time.Duration
-		found     bool
-	)
-
-	for _, expiration := range asset.Expirations {
-		expiration = expiration.UTC()
-
-		remaining := expiration.Sub(now)
-
-		// Reject expirations that are clearly not M15.
-		//
-		// The exact expiration must come from the server. We only choose
-		// from the server-provided list.
-		if remaining < 13*time.Minute ||
-			remaining > 17*time.Minute {
-			continue
-		}
-
-		delta := absDuration(remaining - target)
-
-		if !found || delta < bestDelta {
-			found = true
-			best = expiration
-			bestDelta = delta
-		}
-	}
-
-	return best, found
-}
-
-func absDuration(value time.Duration) time.Duration {
-	if value < 0 {
-		return -value
-	}
-
-	return value
-}
-
-// postToolCallNoRetry is specifically for operations where duplicate execution
-// would be dangerous.
-func (c *Client) postToolCallNoRetry(
-	ctx context.Context,
-	tool string,
-	arguments map[string]any,
-) ([]byte, error) {
-	if err := c.initialize(ctx); err != nil {
-		return nil, err
-	}
-
-	result, err := c.callWithoutRetry(
-		ctx,
-		"tools/call",
-		ToolCallParams{
-			Name:      tool,
-			Arguments: arguments,
-		},
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	return decodeMCPToolResult(result)
-}
-
-func (c *Client) callWithoutRetry(
-	ctx context.Context,
-	method string,
-	params any,
-) ([]byte, error) {
-	if c.IsClosed() {
-		return nil, ErrClosed
-	}
-
-	if err := c.initialize(ctx); err != nil {
-		return nil, err
-	}
-
-	requestID := c.nextRequestID()
-
-	request := JSONRPCRequest{
-		JSONRPC: "2.0",
-		ID:      requestID,
-		Method:  method,
-		Params:  params,
-	}
-
-	body, err := json.Marshal(request)
-	if err != nil {
-		return nil, fmt.Errorf("encode request: %w", err)
-	}
-
-	result, _, err := c.doHTTP(ctx, body)
 	if err != nil {
 		return nil, err
 	}

@@ -1,4 +1,4 @@
-package iqclient
+package iqoption
 
 import (
 	"encoding/json"
@@ -37,6 +37,18 @@ type Asset struct {
 	BuybackEnabled         bool
 	BuybackDeadtimeSeconds int
 }
+
+type CandleSize int
+
+const (
+	CandleSize1Minute   CandleSize = 60
+	CandleSize5Minutes  CandleSize = CandleSize1Minute * 5
+	CandleSize15Minutes CandleSize = CandleSize1Minute * 15
+	CandleSize30Minutes CandleSize = CandleSize1Minute * 30
+	CandleSize1Hour     CandleSize = CandleSize1Minute * 60
+	CandleSize4Hours    CandleSize = CandleSize1Hour * 4
+	CandleSize1Day      CandleSize = CandleSize1Hour * 24
+)
 
 // Candle represents one OHLC candle.
 type Candle struct {
@@ -87,6 +99,13 @@ type Trade struct {
 	Result      string
 }
 
+type TradeDirection string
+
+const (
+	TradeDirectionCall TradeDirection = "call"
+	TradeDirectionPut  TradeDirection = "put"
+)
+
 // TradeRequest describes a trade.
 //
 // Expired MUST be one of the expiration timestamps returned by ListAssets.
@@ -94,7 +113,7 @@ type Trade struct {
 type TradeRequest struct {
 	BalanceID     int64
 	AssetID       int64
-	Direction     string
+	Direction     TradeDirection
 	Amount        float64
 	ProfitPercent float64
 	Expired       time.Time
@@ -130,9 +149,9 @@ type JSONRPCResponse struct {
 }
 
 type JSONRPCError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-	Data    any    `json:"data,omitempty"`
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data,omitempty"`
 }
 
 type InitializeParams struct {
@@ -160,4 +179,28 @@ type MCPToolResult struct {
 	Content           []MCPContent    `json:"content"`
 	StructuredContent json.RawMessage `json:"structuredContent"`
 	IsError           bool            `json:"isError"`
+}
+
+type LimitBuckets struct {
+	Bucket        string `json:"bucket"`
+	Limit         int    `json:"limit"`
+	WindowSeconds int    `json:"window_seconds"`
+}
+
+type GetLimitsResponse struct {
+	Buckets []LimitBuckets `json:"buckets"`
+	Product string         `json:"product"`
+	Scope   string         `json:"scope"`
+	Tools   struct {
+		GetCandles       string `json:"get_candles"`
+		GetCapabilities  string `json:"get_capabilities"`
+		GetLimits        string `json:"get_limits"`
+		GetTradeHistory  string `json:"get_trade_history"`
+		ListAssets       string `json:"list_assets"`
+		ListBalances     string `json:"list_balances"`
+		ListPositions    string `json:"list_positions"`
+		PlaceTrade       string `json:"place_trade"`
+		RolloverPosition string `json:"rollover_position"`
+		SellPosition     string `json:"sell_position"`
+	} `json:"tools"`
 }

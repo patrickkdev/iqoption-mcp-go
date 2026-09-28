@@ -1,7 +1,8 @@
-package iqclient
+package iqoption
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
@@ -18,7 +19,8 @@ const (
 	//
 	// This is intentionally separate from IQOPTION_LIVE_TEST because a test
 	// that merely reads account data should not be able to place an order.
-	liveTradeEnv = "IQOPTION_LIVE_TRADE"
+	liveTradeEnv           = "IQOPTION_LIVE_TRADE"
+	liveTradeWaitResultEnv = "IQOPTION_LIVE_TRADE_WAIT_RESULT"
 )
 
 func liveClient(t *testing.T) *Client {
@@ -36,18 +38,13 @@ func liveClient(t *testing.T) *Client {
 	)
 
 	if token == "" {
-		t.Skip(
+		t.Fatal(
 			"IQOPTION_TEST_TOKEN is not configured",
 		)
 	}
 
 	client, err := New(Config{
-		Token: token,
-
-		// Keep the integration tests deliberately conservative.
-		MaxRetries:     2,
-		RetryBaseDelay: 500 * time.Millisecond,
-
+		Token:         token,
 		ClientName:    "iqoption-mcp-client-integration-test",
 		ClientVersion: "test",
 	})
@@ -239,7 +236,7 @@ func TestLive_ListAssets(t *testing.T) {
 	}
 }
 
-func TestLive_GetCandlesM15(t *testing.T) {
+func TestLive_GetCandles(t *testing.T) {
 	client := liveClient(t)
 
 	ctx, cancel := context.WithTimeout(
@@ -260,14 +257,24 @@ func TestLive_GetCandlesM15(t *testing.T) {
 		t.Fatal("no enabled assets returned")
 	}
 
-	// Pick the first currently-open asset. We don't hard-code EURUSD because
-	// the server's available asset list can change.
-	asset := assets[0]
+	var asset *Asset
+
+	for i := range assets {
+		if assets[i].IsOpen &&
+			len(assets[i].Expirations) > 0 {
+			asset = &assets[i]
+			break
+		}
+	}
+
+	if asset == nil {
+		t.Skip("no open asset with an expiration was available")
+	}
 
 	candles, err := client.GetCandles(
 		ctx,
 		asset.ID,
-		900, // M15
+		CandleSize15Minutes,
 		20,
 	)
 	if err != nil {
@@ -306,20 +313,21 @@ func TestLive_GetCandlesM15(t *testing.T) {
 			)
 		}
 
-		if candle.Open <= 0 ||
-			candle.Close <= 0 ||
-			candle.High <= 0 ||
-			candle.Low <= 0 {
+		if candle.High < candle.Open ||
+			candle.High < candle.Close ||
+			candle.High < candle.Low {
 			t.Errorf(
-				"candle %d has invalid OHLC: %+v",
+				"candle %d has invalid high: %+v",
 				i,
 				candle,
 			)
 		}
 
-		if candle.High < candle.Low {
+		if candle.Low > candle.Open ||
+			candle.Low > candle.Close ||
+			candle.Low > candle.High {
 			t.Errorf(
-				"candle %d has high < low: %+v",
+				"candle %d has invalid low: %+v",
 				i,
 				candle,
 			)
@@ -444,4 +452,346 @@ func TestLive_TradeHistory(t *testing.T) {
 			trade.Result,
 		)
 	}
+}
+
+func TestLive_GetAssetByID(t *testing.T) {
+	client := liveClient(t)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	assets, err := client.ListAssets(ctx, true)
+	if err != nil {
+		t.Fatalf("ListAssets() failed: %v", err)
+	}
+
+	if len(assets) == 0 {
+		t.Fatal("no enabled assets returned")
+	}
+
+	expected := assets[0]
+
+	asset, found, err := client.GetAssetByID(
+		ctx,
+		expected.ID,
+	)
+	if err != nil {
+		t.Fatalf(
+			"GetAssetByID(%d) failed: %v",
+			expected.ID,
+			err,
+		)
+	}
+
+	if !found {
+		t.Fatalf(
+			"GetAssetByID(%d) returned found=false",
+			expected.ID,
+		)
+	}
+
+	if asset == nil {
+		t.Fatal("GetAssetByID() returned nil asset")
+	}
+
+	if asset.ID != expected.ID {
+		t.Errorf(
+			"asset ID mismatch: got %d, want %d",
+			asset.ID,
+			expected.ID,
+		)
+	}
+
+	if asset.Name != expected.Name {
+		t.Errorf(
+			"asset name mismatch: got %q, want %q",
+			asset.Name,
+			expected.Name,
+		)
+	}
+
+	t.Logf(
+		"found asset id=%d name=%s open=%t",
+		asset.ID,
+		asset.Name,
+		asset.IsOpen,
+	)
+}
+
+func TestLive_GetAssetByID_NotFound(t *testing.T) {
+	client := liveClient(t)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	assets, err := client.ListAssets(ctx, false)
+	if err != nil {
+		t.Fatalf("ListAssets() failed: %v", err)
+	}
+
+	unknownID := int64(1)
+
+	for _, asset := range assets {
+		if asset.ID >= unknownID {
+			unknownID = asset.ID + 1
+		}
+	}
+
+	asset, found, err := client.GetAssetByID(
+		ctx,
+		unknownID,
+	)
+	if err != nil {
+		t.Fatalf(
+			"GetAssetByID(%d) failed: %v",
+			unknownID,
+			err,
+		)
+	}
+
+	if found {
+		t.Fatalf(
+			"GetAssetByID(%d) returned found=true for unknown asset",
+			unknownID,
+		)
+	}
+
+	if asset != nil {
+		t.Fatalf(
+			"GetAssetByID(%d) returned asset despite found=false: %+v",
+			unknownID,
+			asset,
+		)
+	}
+}
+
+func TestLive_GetAssetByName(t *testing.T) {
+	client := liveClient(t)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	assets, err := client.ListAssets(ctx, true)
+	if err != nil {
+		t.Fatalf("ListAssets() failed: %v", err)
+	}
+
+	if len(assets) == 0 {
+		t.Fatal("no enabled assets returned")
+	}
+
+	expected := assets[0]
+
+	// Exercise the intentionally forgiving name matching:
+	// case, whitespace, separators and non-alphanumeric characters
+	// should all be ignored.
+	var query strings.Builder
+
+	for _, r := range expected.Name {
+		switch {
+		case r >= 'a' && r <= 'z':
+			query.WriteRune(r - ('a' - 'A'))
+		case r >= 'A' && r <= 'Z':
+			query.WriteRune(r)
+		case r >= '0' && r <= '9':
+			query.WriteRune(r)
+		default:
+			query.WriteRune('_')
+		}
+	}
+
+	name := "  " + query.String() + "  "
+
+	asset, found, err := client.GetAssetByName(
+		ctx,
+		name,
+	)
+	if err != nil {
+		t.Fatalf(
+			"GetAssetByName(%q) failed: %v",
+			name,
+			err,
+		)
+	}
+
+	if !found {
+		t.Fatalf(
+			"GetAssetByName(%q) returned found=false; expected %q",
+			name,
+			expected.Name,
+		)
+	}
+
+	if asset == nil {
+		t.Fatal("GetAssetByName() returned nil asset")
+	}
+
+	if asset.ID != expected.ID {
+		t.Errorf(
+			"asset ID mismatch: got %d, want %d",
+			asset.ID,
+			expected.ID,
+		)
+	}
+
+	if asset.Name != expected.Name {
+		t.Errorf(
+			"asset name mismatch: got %q, want %q",
+			asset.Name,
+			expected.Name,
+		)
+	}
+
+	t.Logf(
+		"found asset name=%s id=%d using query=%q",
+		asset.Name,
+		asset.ID,
+		name,
+	)
+}
+
+func TestLive_GetAssetByName_NotFound(t *testing.T) {
+	client := liveClient(t)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	asset, found, err := client.GetAssetByName(
+		ctx,
+		"__definitely_not_a_real_iq_option_asset__",
+	)
+	if err != nil {
+		t.Fatalf(
+			"GetAssetByName() failed: %v",
+			err,
+		)
+	}
+
+	if found {
+		t.Fatal(
+			"GetAssetByName() returned found=true for unknown asset",
+		)
+	}
+
+	if asset != nil {
+		t.Fatalf(
+			"GetAssetByName() returned asset despite found=false: %+v",
+			asset,
+		)
+	}
+}
+
+func TestLive_GetAssetByName_Empty(t *testing.T) {
+	client := liveClient(t)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	asset, found, err := client.GetAssetByName(
+		ctx,
+		"   ---___   ",
+	)
+	if err != nil {
+		t.Fatalf(
+			"GetAssetByName(empty normalized name) failed: %v",
+			err,
+		)
+	}
+
+	if found {
+		t.Fatal(
+			"GetAssetByName() returned found=true for empty normalized name",
+		)
+	}
+
+	if asset != nil {
+		t.Fatalf(
+			"GetAssetByName() returned asset for empty normalized name: %+v",
+			asset,
+		)
+	}
+}
+
+func TestLive_GetLimits(t *testing.T) {
+	client := liveClient(t)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	limits, err := client.GetLimits(ctx)
+	if err != nil {
+		t.Fatalf(
+			"GetLimits() failed: %v",
+			err,
+		)
+	}
+
+	if len(limits) == 0 {
+		t.Fatal("expected at least one limit bucket")
+	}
+
+	for i, bucket := range limits {
+		t.Logf(
+			"limit bucket %d: %+v",
+			i,
+			bucket,
+		)
+	}
+}
+
+func TestLive_ListTools(t *testing.T) {
+	client := liveClient(t)
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		30*time.Second,
+	)
+	defer cancel()
+
+	result, err := client.ListTools(ctx)
+	if err != nil {
+		t.Fatalf(
+			"ListTools() failed: %v",
+			err,
+		)
+	}
+
+	if len(result) == 0 {
+		t.Fatal("ListTools() returned empty response")
+	}
+
+	// Verify that the response is valid JSON without making the test
+	// dependent on the exact set/order of tools exposed by the server.
+	var payload map[string]any
+
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf(
+			"ListTools() returned invalid JSON: %v\nresponse=%s",
+			err,
+			string(result),
+		)
+	}
+
+	t.Logf(
+		"ListTools() returned %d top-level fields",
+		len(payload),
+	)
 }
