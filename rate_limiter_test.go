@@ -148,12 +148,12 @@ func TestRateLimiter_WaitRead(t *testing.T) {
 
 	ctx := context.Background()
 
-	if err := l.WaitRead(ctx); err != nil {
-		t.Fatalf("first WaitRead() error = %v", err)
+	if err := l.Read.Wait(ctx); err != nil {
+		t.Fatalf("first wait read error = %v", err)
 	}
 
-	if err := l.WaitRead(ctx); err != nil {
-		t.Fatalf("second WaitRead() error = %v", err)
+	if err := l.Read.Wait(ctx); err != nil {
+		t.Fatalf("second wait read error = %v", err)
 	}
 }
 
@@ -168,12 +168,32 @@ func TestRateLimiter_WaitWrite(t *testing.T) {
 
 	ctx := context.Background()
 
-	if err := l.WaitWrite(ctx); err != nil {
-		t.Fatalf("first WaitWrite() error = %v", err)
+	if err := l.Write.Wait(ctx); err != nil {
+		t.Fatalf("first wait write error = %v", err)
 	}
 
-	if err := l.WaitWrite(ctx); err != nil {
-		t.Fatalf("second WaitWrite() error = %v", err)
+	if err := l.Write.Wait(ctx); err != nil {
+		t.Fatalf("second wait write error = %v", err)
+	}
+}
+
+func TestRateLimiter_WaitGateway(t *testing.T) {
+	t.Parallel()
+
+	l := NewRateLimiterFromLimits(RateLimits{
+		GatewayPerMinute: 1000,
+		ReadPerMinute:    1000,
+		WritePerMinute:   1000,
+	})
+
+	ctx := context.Background()
+
+	if err := l.Gateway.Wait(ctx); err != nil {
+		t.Fatalf("first wait gateway error = %v", err)
+	}
+
+	if err := l.Gateway.Wait(ctx); err != nil {
+		t.Fatalf("second wait gateway error = %v", err)
 	}
 }
 
@@ -194,7 +214,7 @@ func TestRateLimiter_WaitRead_CancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := l.WaitRead(ctx)
+	err := l.Read.Wait(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("WaitRead() error = %v, want %v", err, context.Canceled)
 	}
@@ -217,13 +237,13 @@ func TestRateLimiter_WaitWrite_CancelledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := l.WaitWrite(ctx)
+	err := l.Write.Wait(ctx)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("WaitWrite() error = %v, want %v", err, context.Canceled)
 	}
 }
 
-func TestRateLimiter_WaitRead_GatewayCancellation(t *testing.T) {
+func TestRateLimiter_WaitGateway_Cancellation(t *testing.T) {
 	t.Parallel()
 
 	l := NewRateLimiterFromLimits(RateLimits{
@@ -239,51 +259,7 @@ func TestRateLimiter_WaitRead_GatewayCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	err := l.WaitRead(ctx)
-	if err == nil {
-		t.Fatal("WaitRead() error = nil, want an error")
-	}
-}
-
-func TestRateLimiter_WaitWrite_GatewayCancellation(t *testing.T) {
-	t.Parallel()
-
-	l := NewRateLimiterFromLimits(RateLimits{
-		GatewayPerMinute: 1,
-		ReadPerMinute:    1000,
-		WritePerMinute:   1000,
-	})
-
-	if err := l.Gateway.Wait(context.Background()); err != nil {
-		t.Fatalf("consuming gateway token: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-
-	err := l.WaitWrite(ctx)
-	if err == nil {
-		t.Fatal("WaitWrite() error = nil, want an error")
-	}
-}
-
-func TestRateLimiter_ReadAndWriteConsumeGateway(t *testing.T) {
-	t.Parallel()
-
-	l := NewRateLimiterFromLimits(RateLimits{
-		GatewayPerMinute: 1,
-		ReadPerMinute:    1000,
-		WritePerMinute:   1000,
-	})
-
-	if err := l.WaitRead(context.Background()); err != nil {
-		t.Fatalf("WaitRead() error = %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
-
-	err := l.WaitWrite(ctx)
+	err := l.Gateway.Wait(ctx)
 	if err == nil {
 		t.Fatal("WaitWrite() error = nil, want an error")
 	}

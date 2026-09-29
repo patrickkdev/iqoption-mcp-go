@@ -1,7 +1,6 @@
 package iqoption
 
 import (
-	"context"
 	"sync"
 	"time"
 
@@ -56,26 +55,4 @@ func (l *RateLimiter) Update(limits RateLimits) {
 	l.Gateway.SetBurst(1)
 	l.Read.SetBurst(1)
 	l.Write.SetBurst(1)
-}
-
-// WaitRead reserves both the gateway and read buckets.
-//
-// We deliberately reserve the gateway first because every request
-// consumes it. If waiting for the second bucket is cancelled, the
-// gateway reservation may have been consumed; callers should simply
-// propagate the context cancellation.
-func (l *RateLimiter) WaitRead(ctx context.Context) error {
-	if err := l.Gateway.Wait(ctx); err != nil {
-		return err
-	}
-
-	return l.Read.Wait(ctx)
-}
-
-func (l *RateLimiter) WaitWrite(ctx context.Context) error {
-	if err := l.Gateway.Wait(ctx); err != nil {
-		return err
-	}
-
-	return l.Write.Wait(ctx)
 }

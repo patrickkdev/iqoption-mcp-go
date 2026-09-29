@@ -47,7 +47,7 @@ func TestClientClose(t *testing.T) {
 
 	ctx := context.Background()
 
-	_, err = client.call(ctx, "test", nil)
+	_, err = client.call(ctx, "tools/call", nil)
 	if !errors.Is(err, ErrClosed) {
 		t.Fatalf("expected ErrClosed, got %v", err)
 	}
@@ -140,24 +140,6 @@ func TestDecodeMCPResponseSSE(t *testing.T) {
 
 	if !json.Valid(result) {
 		t.Fatalf("result is not JSON: %s", result)
-	}
-}
-
-func TestRateLimitError(t *testing.T) {
-	err := newRateLimitError(
-		"5",
-		"too many requests",
-	)
-
-	if !errors.Is(err, ErrRateLimited) {
-		t.Fatal("expected ErrRateLimited")
-	}
-
-	if err.RetryAfter != 5*time.Second {
-		t.Fatalf(
-			"RetryAfter=%s, want 5s",
-			err.RetryAfter,
-		)
 	}
 }
 
@@ -467,7 +449,7 @@ func TestSessionRecoveryDoesNotRetryTrade(t *testing.T) {
 		"tools/call",
 		ToolCallParams{
 			Name:      "place_trade",
-			Arguments: map[string]any{},
+			Arguments: nil,
 		},
 	)
 

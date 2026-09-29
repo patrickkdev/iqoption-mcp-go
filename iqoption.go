@@ -689,7 +689,7 @@ func (c *Client) GetLimits(
 }
 
 func (c *Client) ListTools(ctx context.Context) ([]byte, error) {
-	result, err := c.call(ctx, "tools/list", map[string]any{})
+	result, err := c.call(ctx, "tools/list", nil)
 	if err != nil {
 		return nil, err
 	}

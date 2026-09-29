@@ -11,7 +11,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -204,7 +203,11 @@ func (c *Client) clearSession(expected string) bool {
 	return true
 }
 
-func (c *Client) loadRateLimits(ctx context.Context) error {
+func (c *Client) loadRateLimitsOnce(ctx context.Context) error {
+	if c.rateLimitsLoaded.Load() {
+		return nil
+	}
+
 	c.rateLimitsMu.Lock()
 	defer c.rateLimitsMu.Unlock()
 
@@ -426,14 +429,20 @@ func (c *Client) callTool(
 	arguments map[string]any,
 ) ([]byte, error) {
 	if tool != getLimitsToolName {
-		if err := c.loadRateLimits(ctx); err != nil {
+		if err := c.loadRateLimitsOnce(ctx); err != nil {
 			return nil, err
 		}
 	}
 
 	for attempt := 0; attempt <= c.maxRateLimitRetries; attempt++ {
-		if err := c.waitRateLimit(ctx, tool); err != nil {
-			return nil, err
+		if c.toolIsWrite(tool) {
+			if err := c.rateLimiter.Write.Wait(ctx); err != nil {
+				return nil, err
+			}
+		} else {
+			if err := c.rateLimiter.Read.Wait(ctx); err != nil {
+				return nil, err
+			}
 		}
 
 		result, err := c.call(
@@ -468,7 +477,6 @@ func (c *Client) callTool(
 			return nil, err
 		}
 
-		log.Printf("rate limited: waiting %f before retrying", rateLimitErr.RetryAfter.Seconds())
 		if err := waitRateLimitError(
 			ctx,
 			rateLimitErr,
@@ -480,26 +488,14 @@ func (c *Client) callTool(
 	return nil, errors.New("rate limit retry loop exhausted")
 }
 
-func (c *Client) waitRateLimit(ctx context.Context, tool string) error {
-	var waitFunc func(context.Context) error
-
-	if c.toolIsWrite(tool) {
-		waitFunc = c.rateLimiter.WaitWrite
-	} else {
-		waitFunc = c.rateLimiter.WaitRead
-	}
-
-	return waitFunc(ctx)
-}
-
 func waitRateLimitError(
 	ctx context.Context,
 	err *RateLimitError,
 ) error {
-	delay := err.RetryAfter
+	delay := time.Until(err.ResetAt)
 
-	if delay <= 0 && !err.ResetAt.IsZero() {
-		delay = time.Until(err.ResetAt)
+	if delay <= 0 && err.RetryAfter > 0 {
+		delay = err.RetryAfter
 	}
 
 	if delay <= 0 {
@@ -602,6 +598,10 @@ func (c *Client) doHTTP(
 		c.protocol,
 	)
 
+	if err := c.rateLimiter.Gateway.Wait(ctx); err != nil {
+		return nil, "", err
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, "", classifyNetworkError(err)
@@ -690,156 +690,6 @@ func (c *Client) doHTTP(
 	}
 
 	return rpc.Result, responseSessionID, nil
-}
-
-func newRateLimitError(
-	retryAfter string,
-	message string,
-) *RateLimitError {
-	err := &RateLimitError{
-		Message: message,
-	}
-
-	retryAfter = strings.TrimSpace(retryAfter)
-	if retryAfter == "" {
-		return err
-	}
-
-	// Retry-After may be a number of seconds.
-	if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil {
-		if seconds >= 0 {
-			err.RetryAfter = time.Duration(seconds) * time.Second
-		}
-
-		return err
-	}
-
-	// Or an HTTP date.
-	if when, parseErr := http.ParseTime(retryAfter); parseErr == nil {
-		if duration := time.Until(when); duration > 0 {
-			err.RetryAfter = duration
-		}
-	}
-
-	return err
-}
-
-func decodeMCPResponse(
-	body []byte,
-	contentType string,
-) ([]byte, error) {
-	body = bytes.TrimSpace(body)
-
-	if len(body) == 0 {
-		return nil, errors.New("empty MCP response")
-	}
-
-	if json.Valid(body) {
-		return body, nil
-	}
-
-	if strings.Contains(
-		strings.ToLower(contentType),
-		"text/event-stream",
-	) {
-		return decodeMCPSSE(body)
-	}
-
-	return nil, fmt.Errorf(
-		"invalid MCP response: content-type=%q body=%q",
-		contentType,
-		summarizeBody(body),
-	)
-}
-
-func decodeMCPSSE(body []byte) ([]byte, error) {
-	lines := strings.Split(
-		strings.ReplaceAll(
-			string(body),
-			"\r\n",
-			"\n",
-		),
-		"\n",
-	)
-
-	var dataLines []string
-	var sawEvent bool
-
-	flush := func() ([]byte, bool, error) {
-		if len(dataLines) == 0 {
-			return nil, false, nil
-		}
-
-		data := strings.TrimSpace(
-			strings.Join(dataLines, "\n"),
-		)
-
-		dataLines = nil
-
-		if data == "" || data == "[DONE]" {
-			return nil, false, nil
-		}
-
-		if !json.Valid([]byte(data)) {
-			return nil, false, fmt.Errorf(
-				"invalid JSON in MCP SSE data: %q",
-				summarizeBody([]byte(data)),
-			)
-		}
-
-		return []byte(data), true, nil
-	}
-
-	for _, line := range lines {
-		// SSE comments/metadata.
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-
-		if after, ok := strings.CutPrefix(line, "data:"); ok {
-			sawEvent = true
-
-			// SSE permits an optional single leading space after ":".
-			dataLines = append(
-				dataLines,
-				strings.TrimPrefix(after, " "),
-			)
-			continue
-		}
-
-		// A blank line terminates an SSE event.
-		if line == "" {
-			result, ok, err := flush()
-			if err != nil {
-				return nil, err
-			}
-
-			if ok {
-				return result, nil
-			}
-
-			continue
-		}
-	}
-
-	result, ok, err := flush()
-	if err != nil {
-		return nil, err
-	}
-
-	if ok {
-		return result, nil
-	}
-
-	if !sawEvent {
-		return nil, errors.New(
-			"no SSE data events found in MCP response",
-		)
-	}
-
-	return nil, errors.New(
-		"no JSON content found in MCP SSE response",
-	)
 }
 
 func classifyNetworkError(err error) error {
