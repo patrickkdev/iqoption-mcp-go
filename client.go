@@ -464,7 +464,6 @@ func (c *Client) callTool(
 
 		var rateLimitErr *RateLimitError
 		if !errors.As(err, &rateLimitErr) {
-			log.Printf("unexpected error: %v", err)
 			return nil, err
 		}
 
